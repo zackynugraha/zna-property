@@ -1,0 +1,23 @@
+{
+  "name": "rentbook-apartemen",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Full-stack apartment rental bookkeeping app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "connect-pg-simple": "^10.0.0",
+    "csv-stringify": "^6.6.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
+    "express-session": "^1.18.2",
+    "helmet": "^8.1.0",
+    "pg": "^8.16.3",
+    "zod": "^4.0.17"
+  }
+}
