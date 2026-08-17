@@ -235,6 +235,21 @@ async function initDb() {
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
   await q(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_apartment_lease ON apartment_leases(apartment_id) WHERE status='active'`);
+  await q(`CREATE TABLE IF NOT EXISTS recurring_expenses (
+    id BIGSERIAL PRIMARY KEY,
+    apartment_id BIGINT REFERENCES apartments(id) ON DELETE CASCADE,
+    category TEXT NOT NULL,
+    amount NUMERIC(14,2) NOT NULL CHECK(amount >= 0),
+    start_date DATE NOT NULL,
+    end_date DATE,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    description TEXT,
+    created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK(end_date IS NULL OR end_date >= start_date)
+  )`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_recurring_expenses_active ON recurring_expenses(active,start_date,end_date)`);
   await q(`CREATE TABLE IF NOT EXISTS property_partners (
     id BIGSERIAL PRIMARY KEY,
     apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
@@ -367,6 +382,22 @@ app.delete('/api/leases/:id',asyncHandler(async(req,res)=>{const id=validId(req.
 app.get('/api/payments',asyncHandler(async(req,res)=>{res.json(await q(`SELECT p.*,u.unit_code,a.name apartment_name,t.name tenant_name FROM payments p JOIN units u ON u.id=p.unit_id JOIN apartments a ON a.id=u.apartment_id LEFT JOIN tenants t ON t.id=p.tenant_id ORDER BY p.payment_date DESC,p.id DESC`));}));
 app.post('/api/payments',asyncHandler(async(req,res)=>{const b=req.body;const r=await one(`INSERT INTO payments(lease_id,unit_id,tenant_id,payment_date,period_month,amount,payment_method,reference,description,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,[b.lease_id?validId(b.lease_id,'lease_id'):null,validId(b.unit_id,'unit_id'),b.tenant_id?validId(b.tenant_id,'tenant_id'):null,dateSchema.parse(b.payment_date),b.period_month?`${b.period_month}-01`:null,moneySchema.parse(b.amount),clean(b.payment_method)||'bank_transfer',clean(b.reference)||null,clean(b.description)||null,req.session.user.id]);await audit(req.session.user.id,'CREATE','payment',r.id,r);res.status(201).json(r);}));
 app.delete('/api/payments/:id',asyncHandler(async(req,res)=>{const id=validId(req.params.id,'id');await q(`DELETE FROM payments WHERE id=$1`,[id]);await audit(req.session.user.id,'DELETE','payment',id);res.json({ok:true});}));
+
+app.get('/api/recurring-expenses',asyncHandler(async(req,res)=>{
+  res.json(await q(`SELECT r.*,a.name apartment_name FROM recurring_expenses r LEFT JOIN apartments a ON a.id=r.apartment_id ORDER BY r.active DESC,r.id DESC`));
+}));
+app.post('/api/recurring-expenses',adminOnly,asyncHandler(async(req,res)=>{
+  const b=req.body;
+  if(!clean(b.category)) return res.status(400).json({error:'Kategori biaya rutin wajib diisi'});
+  const r=await one(`INSERT INTO recurring_expenses(apartment_id,category,amount,start_date,end_date,active,description,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,[b.apartment_id?validId(b.apartment_id,'apartment_id'):null,clean(b.category),moneySchema.parse(b.amount),dateSchema.parse(b.start_date),b.end_date?dateSchema.parse(b.end_date):null,b.active!==false,clean(b.description)||null,req.session.user.id]);
+  await audit(req.session.user.id,'CREATE','recurring_expense',r.id,r); res.status(201).json(r);
+}));
+app.put('/api/recurring-expenses/:id',adminOnly,asyncHandler(async(req,res)=>{
+  const id=validId(req.params.id,'id'),b=req.body;
+  const r=await one(`UPDATE recurring_expenses SET apartment_id=$1,category=$2,amount=$3,start_date=$4,end_date=$5,active=$6,description=$7,updated_at=NOW() WHERE id=$8 RETURNING *`,[b.apartment_id?validId(b.apartment_id,'apartment_id'):null,clean(b.category),moneySchema.parse(b.amount),dateSchema.parse(b.start_date),b.end_date?dateSchema.parse(b.end_date):null,b.active!==false,clean(b.description)||null,id]);
+  if(!r)return res.status(404).json({error:'Biaya rutin tidak ditemukan'}); await audit(req.session.user.id,'UPDATE','recurring_expense',id,r); res.json(r);
+}));
+app.delete('/api/recurring-expenses/:id',adminOnly,asyncHandler(async(req,res)=>{const id=validId(req.params.id,'id');await q(`DELETE FROM recurring_expenses WHERE id=$1`,[id]);await audit(req.session.user.id,'DELETE','recurring_expense',id);res.json({ok:true})}));
 
 app.get('/api/expenses',asyncHandler(async(req,res)=>{res.json(await q(`SELECT e.*,a.name apartment_name,u.unit_code FROM expenses e LEFT JOIN apartments a ON a.id=e.apartment_id LEFT JOIN units u ON u.id=e.unit_id ORDER BY e.expense_date DESC,e.id DESC`));}));
 app.post('/api/expenses',asyncHandler(async(req,res)=>{const b=req.body;const r=await one(`INSERT INTO expenses(apartment_id,unit_id,expense_date,category,amount,vendor,description,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,[b.apartment_id?validId(b.apartment_id,'apartment_id'):null,b.unit_id?validId(b.unit_id,'unit_id'):null,dateSchema.parse(b.expense_date),clean(b.category),moneySchema.parse(b.amount),clean(b.vendor)||null,clean(b.description)||null,req.session.user.id]);await audit(req.session.user.id,'CREATE','expense',r.id,r);res.status(201).json(r);}));
@@ -525,30 +556,42 @@ app.delete('/api/stay-payments/:id',asyncHandler(async(req,res)=>{
 app.get('/api/dashboard',asyncHandler(async(req,res)=>{
   const from=req.query.from&&/^\d{4}-\d{2}-\d{2}$/.test(req.query.from)?req.query.from:null;
   const to=req.query.to&&/^\d{4}-\d{2}-\d{2}$/.test(req.query.to)?req.query.to:null;
-  const payParams=[]; const expParams=[]; const payWhere=[]; const expWhere=[];
-  if(from){payWhere.push(`payment_date >= $${payParams.length+1}`);payParams.push(from);expWhere.push(`expense_date >= $${expParams.length+1}`);expParams.push(from);}
-  if(to){payWhere.push(`payment_date <= $${payParams.length+1}`);payParams.push(to);expWhere.push(`expense_date <= $${expParams.length+1}`);expParams.push(to);}
-  const payCondition=payWhere.length?'WHERE '+payWhere.join(' AND '):''; const expCondition=expWhere.length?'WHERE '+expWhere.join(' AND '):'';
-  const [income,expense,masterRent,units,active,arrears,monthly,byApartment] = await Promise.all([
-    one(`SELECT COALESCE(SUM(s.total_amount),0) value FROM stays s WHERE s.status <> 'cancelled' ${from?`AND s.check_out >= $1`:''} ${to?`AND s.check_in <= $${from?2:1}`:''}`, from&&to?[from,to]:from?[from]:to?[to]:[]),
-    one(`SELECT COALESCE(SUM(amount),0) value FROM expenses ${expCondition}`,expParams),
-    one(`SELECT COALESCE(SUM(monthly_rent),0) value FROM apartment_leases WHERE status='active'`),
-    one(`SELECT COUNT(*) value FROM units`),
-    one(`SELECT COUNT(*) value FROM units WHERE status='occupied'`),
-    one(`SELECT COALESCE(SUM(GREATEST(l.monthly_rent - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.lease_id=l.id AND p.period_month=DATE_TRUNC('month', CURRENT_DATE)),0),0)),0) value FROM leases l WHERE l.status='active'`),
-    q(`SELECT TO_CHAR(DATE_TRUNC('month',payment_date),'YYYY-MM') AS "month",COALESCE(SUM(amount),0) value FROM payments GROUP BY 1 ORDER BY 1 DESC LIMIT 12`),
-    q(`SELECT a.name,SUM(u.monthly_target) target,COUNT(*) units,COUNT(*) FILTER(WHERE u.status='occupied') occupied FROM apartments a LEFT JOIN units u ON u.apartment_id=a.id GROUP BY a.id ORDER BY a.name`)
+  const monthStart=from?from:new Date().toISOString().slice(0,7)+'-01';
+  const monthEnd=to?to:new Date(Date.UTC(new Date().getUTCFullYear(),new Date().getUTCMonth()+1,0)).toISOString().slice(0,10);
+  const [income,expense,masterRent,routineExpense,units,active,arrears,monthly,byApartment]=await Promise.all([
+    one(`SELECT COALESCE(SUM(s.total_amount),0) value FROM stays s WHERE s.status <> 'cancelled' AND s.check_in <= $2::date AND s.check_out > $1::date`,[monthStart,monthEnd]),
+    one(`SELECT COALESCE(SUM(amount),0) value FROM expenses WHERE expense_date BETWEEN $1::date AND $2::date`,[monthStart,monthEnd]),
+    one(`SELECT COALESCE(SUM(monthly_rent),0) value FROM apartment_leases WHERE status='active' AND start_date <= $2::date AND (end_date IS NULL OR end_date >= $1::date)`,[monthStart,monthEnd]),
+    one(`SELECT COALESCE(SUM(amount),0) value FROM recurring_expenses WHERE active=true AND start_date <= $2::date AND (end_date IS NULL OR end_date >= $1::date)`,[monthStart,monthEnd]),
+    one(`SELECT COUNT(*) value FROM units`),one(`SELECT COUNT(*) value FROM units WHERE status='occupied'`),
+    one(`SELECT COALESCE(SUM(GREATEST(l.monthly_rent-COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.lease_id=l.id AND p.period_month=DATE_TRUNC('month',CURRENT_DATE)),0),0)),0) value FROM leases l WHERE l.status='active'`),
+    q(`SELECT TO_CHAR(DATE_TRUNC('month',s.check_in),'YYYY-MM') AS month,COALESCE(SUM(s.total_amount),0) income FROM stays s WHERE s.status <> 'cancelled' GROUP BY 1 ORDER BY 1 DESC LIMIT 12`),
+    q(`SELECT a.id,a.name,SUM(u.monthly_target) target,COUNT(u.id)::int units,COUNT(u.id) FILTER(WHERE u.status='occupied')::int occupied FROM apartments a LEFT JOIN units u ON u.apartment_id=a.id GROUP BY a.id ORDER BY a.name`)
   ]);
-  const gross=Number(income.value), operating=Number(expense.value), rentCost=Number(masterRent.value);
-  res.json({income:gross,expense:operating,masterRent:rentCost,profit:gross-operating-rentCost,units:Number(units.value),occupied:Number(active.value),occupancy:Number(units.value)?Number(active.value)/Number(units.value)*100:0,arrears:Number(arrears.value),monthly,byApartment});
+  const gross=Number(income.value),oneOff=Number(expense.value),rentCost=Number(masterRent.value),routine=Number(routineExpense.value),totalCosts=rentCost+routine+oneOff;
+  res.json({income:gross,expense:oneOff,routineExpense:routine,masterRent:rentCost,totalCosts,profit:gross-totalCosts,units:Number(units.value),occupied:Number(active.value),occupancy:Number(units.value)?Number(active.value)/Number(units.value)*100:0,arrears:Number(arrears.value),monthly,byApartment});
 }));
 
 app.get('/api/reports/monthly',asyncHandler(async(req,res)=>{
-  res.json(await q(`WITH months AS (SELECT DATE_TRUNC('month',CURRENT_DATE) - (n||' month')::interval m FROM generate_series(0,11) n)
-  SELECT TO_CHAR(months.m,'YYYY-MM') AS "month",
-  COALESCE((SELECT SUM(p.amount) FROM payments p WHERE DATE_TRUNC('month',p.payment_date)=months.m),0) income,
-  COALESCE((SELECT SUM(e.amount) FROM expenses e WHERE DATE_TRUNC('month',e.expense_date)=months.m),0) expense
-  FROM months ORDER BY months.m DESC`));
+  const rows=await q(`WITH months AS (SELECT DATE_TRUNC('month',CURRENT_DATE) - (n * INTERVAL '1 month') m FROM generate_series(0,11) n)
+  SELECT TO_CHAR(m.m,'YYYY-MM') month,
+    COALESCE((SELECT SUM(s.total_amount) FROM stays s WHERE s.status<>'cancelled' AND DATE_TRUNC('month',s.check_in)=m.m),0) income,
+    COALESCE((SELECT SUM(al.monthly_rent) FROM apartment_leases al WHERE al.status='active' AND al.start_date <= (m.m + INTERVAL '1 month - 1 day')::date AND (al.end_date IS NULL OR al.end_date >= m.m::date)),0) master_rent,
+    COALESCE((SELECT SUM(re.amount) FROM recurring_expenses re WHERE re.active=true AND re.start_date <= (m.m + INTERVAL '1 month - 1 day')::date AND (re.end_date IS NULL OR re.end_date >= m.m::date)),0) routine_expense,
+    COALESCE((SELECT SUM(e.amount) FROM expenses e WHERE DATE_TRUNC('month',e.expense_date)=m.m),0) one_off_expense
+  FROM months m ORDER BY m.m DESC`);
+  res.json(rows.map(x=>{const income=Number(x.income),rent=Number(x.master_rent),routine=Number(x.routine_expense),oneOff=Number(x.one_off_expense);return {...x,income,master_rent:rent,routine_expense:routine,one_off_expense:oneOff,total_cost:rent+routine+oneOff,net_profit:income-rent-routine-oneOff}}));
+}));
+
+app.get('/api/reports/property',asyncHandler(async(req,res)=>{
+  const month=/^\d{4}-\d{2}$/.test(req.query.month||'')?req.query.month:new Date().toISOString().slice(0,7);
+  const rows=await q(`SELECT a.id,a.name,
+    COALESCE((SELECT SUM(s.total_amount) FROM stays s JOIN units su ON su.id=s.unit_id WHERE su.apartment_id=a.id AND s.status<>'cancelled' AND DATE_TRUNC('month',s.check_in)=DATE_TRUNC('month',$1::date)),0) income,
+    COALESCE((SELECT SUM(al.monthly_rent) FROM apartment_leases al WHERE al.apartment_id=a.id AND al.status='active' AND al.start_date <= (DATE_TRUNC('month',$1::date)+INTERVAL '1 month - 1 day')::date AND (al.end_date IS NULL OR al.end_date >= DATE_TRUNC('month',$1::date)::date)),0) master_rent,
+    COALESCE((SELECT SUM(re.amount) FROM recurring_expenses re WHERE re.apartment_id=a.id AND re.active=true AND re.start_date <= (DATE_TRUNC('month',$1::date)+INTERVAL '1 month - 1 day')::date AND (re.end_date IS NULL OR re.end_date >= DATE_TRUNC('month',$1::date)::date)),0) routine_expense,
+    COALESCE((SELECT SUM(e.amount) FROM expenses e WHERE e.apartment_id=a.id AND DATE_TRUNC('month',e.expense_date)=DATE_TRUNC('month',$1::date)),0) one_off_expense
+    FROM apartments a ORDER BY a.name`,[`${month}-01`]);
+  res.json(rows.map(x=>{const income=Number(x.income),rent=Number(x.master_rent),routine=Number(x.routine_expense),oneOff=Number(x.one_off_expense);return {...x,income,master_rent:rent,routine_expense:routine,one_off_expense:oneOff,total_cost:rent+routine+oneOff,net_profit:income-rent-routine-oneOff}}));
 }));
 
 app.get('/api/audit',asyncHandler(async(req,res)=>{res.json(await q(`SELECT l.*,u.email FROM audit_logs l LEFT JOIN users u ON u.id=l.user_id ORDER BY l.id DESC LIMIT 100`));}));
