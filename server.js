@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
@@ -403,4 +403,3 @@ app.get(/.*/,(req,res)=>res.sendFile(path.join(__dirname,'public','index.html'))
 app.use((err,req,res,next)=>{console.error(err);const msg=err?.code==='23505'?'Data duplikat / konflik':err?.message||'Server error';res.status(400).json({error:msg});});
 
 initDb().then(()=>app.listen(PORT,()=>console.log(`RentBook running on port ${PORT}`))).catch(err=>{console.error('DB init failed',err);process.exit(1);});
-
