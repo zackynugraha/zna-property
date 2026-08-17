@@ -49,6 +49,67 @@ body.sidebar-open{overflow:hidden}
   .mobile-menu-btn,.hamburger,#menuBtn,#mobileMenuBtn{display:none!important}
 }
 </style>
+
+<style id="zna-responsive-fix">
+html,body,#app{width:100%;max-width:100%;overflow-x:hidden}
+body{min-width:0}
+.app,main,.main{min-width:0;max-width:100%;width:100%}
+.main{overflow-x:clip}
+.topbar{min-width:0}
+.actions{min-width:0;max-width:100%}
+.table-wrap{width:100%;max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch}
+.modal-backdrop{overflow:auto}
+.modal{width:min(760px,calc(100vw - 24px));}
+@media (max-width:900px){
+  .app{display:block!important;grid-template-columns:1fr!important}
+  main{display:block!important;width:100%!important}
+  .main{padding:16px 12px 40px!important;overflow-x:clip!important}
+  .mobile-head{position:sticky!important;top:0!important;left:0!important;width:100%!important;z-index:120!important}
+  .topbar{position:static!important;display:flex!important;width:100%!important;margin-bottom:16px!important}
+  .title{font-size:28px!important;line-height:1.08}
+  .subtitle{max-width:100%;line-height:1.45}
+  .actions{width:100%!important;display:flex!important;flex-wrap:wrap!important;justify-content:flex-start!important}
+  .actions .btn{flex:0 1 auto!important;max-width:100%}
+  .kpis{width:100%!important}
+  .grid2{grid-template-columns:minmax(0,1fr)!important;width:100%!important}
+  .property-grid{grid-template-columns:minmax(0,1fr)!important;width:100%!important}
+  .section{min-width:0!important;width:100%!important}
+  .section-head{min-width:0!important;flex-wrap:wrap!important}
+  .section-head>div{min-width:0!important}
+  .property-head{min-width:0!important}
+  .property-name{overflow-wrap:anywhere}
+  .property-metrics{grid-template-columns:repeat(3,minmax(0,1fr))!important}
+  .sidebar{width:min(300px,86vw)!important;max-width:300px!important;transform:translate3d(-110%,0,0)!important;z-index:1000!important}
+  body.nav-open .sidebar,.sidebar.is-open{transform:translate3d(0,0,0)!important}
+  .drawer-overlay{z-index:900!important}
+  body.nav-open{overflow:hidden!important}
+}
+@media (max-width:600px){
+  .main{padding:14px 10px 34px!important}
+  .mobile-head{padding:10px!important}
+  .mobile-head .btn{min-width:40px}
+  .topbar{gap:10px!important}
+  .title{font-size:25px!important}
+  .actions{gap:7px!important}
+  .actions .btn{padding:9px 10px!important;font-size:12px!important}
+  .kpis{grid-template-columns:1fr 1fr!important;gap:8px!important}
+  .kpi{padding:12px!important}
+  .kpi-value{font-size:17px!important}
+  .property-metrics{grid-template-columns:1fr 1fr 1fr!important}
+  .property-card{padding:14px!important}
+  .form-grid{grid-template-columns:1fr!important}
+  .field.full{grid-column:auto!important}
+  .modal-backdrop{padding:8px!important;align-items:flex-end!important}
+  .modal{width:100%!important;max-height:92dvh!important;border-radius:16px 16px 0 0!important}
+  .modal-body{padding:14px!important}
+  .modal-head,.modal-foot{padding:12px 14px!important}
+  .table{min-width:720px}
+}
+@media (max-width:380px){
+  .kpis{grid-template-columns:1fr!important}
+  .property-metrics{grid-template-columns:1fr 1fr!important}
+}
+</style>
 </head>
 <body data-theme="light">
 <div id="app"></div>
@@ -67,17 +128,14 @@ async function logout(){
   const btns=document.querySelectorAll('[onclick*="logout"]');
   btns.forEach(b=>{b.disabled=true;b.style.pointerEvents='none';});
   try{
-    const csrf=state?.csrf||'';
-    await fetch('/api/auth/logout',{
-      method:'POST',
-      credentials:'include',
-      headers:{'Content-Type':'application/json','X-CSRF-Token':csrf}
-    });
-  }catch(e){}
-  try{localStorage.removeItem('zna-theme');sessionStorage.clear();}catch(e){}
+    await api('/api/auth/logout',{method:'POST'});
+  }catch(e){
+    console.warn('Logout request failed:',e.message);
+  }
   state.user=null;
   state.csrf=null;
-  window.location.href='/';
+  try{sessionStorage.clear();}catch(e){}
+  window.location.replace('/');
 }
 function openNav(){document.body.classList.add('nav-open');document.querySelector('.sidebar')?.classList.add('is-open');$('drawerOverlay')?.classList.add('active');document.body.style.overflow='hidden'}
 function closeNav(){document.body.classList.remove('nav-open');document.querySelector('.sidebar')?.classList.remove('is-open');$('drawerOverlay')?.classList.remove('active');document.body.style.overflow=''}
@@ -114,35 +172,6 @@ function openStayPayment(id){const s=state.stays.find(x=>Number(x.id)===Number(i
 function openExpense(){modal('Tambah Pengeluaran',`<div class="form-grid"><div class="field"><label>Property</label><select id="ea">${state.apartments.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></div><div class="field"><label>Tanggal</label><input id="ed" type="date" value="${dateNow()}"></div><div class="field"><label>Kategori</label><input id="ec" placeholder="Cleaning, listrik, maintenance"></div><div class="field"><label>Nominal</label><input id="em" type="number" min="0"></div><div class="field"><label>Vendor</label><input id="ev"></div><div class="field full"><label>Deskripsi</label><textarea id="ex"></textarea></div></div>`,async()=>{await api('/api/expenses',{method:'POST',body:JSON.stringify({apartment_id:$('ea').value,expense_date:$('ed').value,category:$('ec').value,amount:$('em').value,vendor:$('ev').value,description:$('ex').value})})})}
 function openUser(id){const u=id?state.users.find(x=>Number(x.id)===Number(id)):null;modal(id?'Edit akun':'Tambah akun',`<div class="form-grid"><div class="field"><label>Nama</label><input id="unm" value="${esc(u?.name||'')}"></div><div class="field"><label>Email</label><input id="uem" type="email" value="${esc(u?.email||'')}" ${id?'disabled':''}></div><div class="field"><label>Role</label><select id="uro"><option value="viewer" ${u?.role!=='admin'?'selected':''}>Viewer — read only</option><option value="admin" ${u?.role==='admin'?'selected':''}>Admin — input & edit</option></select></div><div class="field"><label>Password ${id?'(kosong = tetap)':''}</label><input id="ups" type="password" minlength="8"></div></div>`,async()=>{const b={name:$('unm').value,role:$('uro').value};if(!id){b.email=$('uem').value;b.password=$('ups').value;if(b.password.length<8)throw Error('Password minimal 8 karakter')}else if($('ups').value)b.password=$('ups').value;await api(id?`/api/users/${id}`:'/api/users',{method:id?'PUT':'POST',body:JSON.stringify(b)})})}
 boot();
-</script>
->
->
-
-<style>
-@media(max-width:900px){
-  .sidebar{position:fixed!important;left:0!important;top:0!important;bottom:0!important;width:min(290px,88vw)!important;height:100dvh!important;transform:translate3d(-110%,0,0)!important;transition:transform .25s cubic-bezier(.2,.8,.2,1)!important;z-index:100!important;overflow-y:auto!important}
-  body.nav-open .sidebar,.sidebar.is-open{transform:translate3d(0,0,0)!important}
-  .drawer-overlay{z-index:90!important}
-  .mobile-head{display:flex!important}
-}
-@media(min-width:901px){.mobile-head{display:none!important}}
-</style>
-<script>
-(function(){
-  function ready(){
-    const overlay=document.getElementById('drawerOverlay');
-    document.addEventListener('keydown',e=>{if(e.key==='Escape')closeNav();});
-    overlay?.addEventListener('click',closeNav);
-
-    document.addEventListener('click',function(e){
-      const menu=e.target.closest('.mobile-head button:first-child,[onclick*="openNav"]');
-      if(menu){e.preventDefault();openNav();return;}
-      const nav=e.target.closest('.nav-btn');
-      if(nav && window.innerWidth<=900) setTimeout(closeNav,0);
-    },true);
-  }
-  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',ready); else ready();
-})();
 </script>
 </body>
 </html>

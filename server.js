@@ -285,7 +285,11 @@ app.post('/api/auth/login', loginLimiter, asyncHandler(async (req,res) => {
 }));
 
 app.post('/api/auth/logout', auth, csrf, asyncHandler(async (req,res) => {
-  req.session.destroy(() => res.json({ ok: true }));
+  req.session.destroy(err => {
+    res.clearCookie('rentbook.sid', { httpOnly: true, sameSite: 'lax', secure: isProd });
+    if (err) return res.status(500).json({ error: 'Logout gagal' });
+    res.json({ ok: true });
+  });
 }));
 
 app.post('/api/auth/change-password', auth, csrf, asyncHandler(async (req,res) => {
