@@ -178,6 +178,39 @@ async function initDb() {
     details JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
   )`);
+  await q(`CREATE TABLE IF NOT EXISTS guests (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    phone TEXT,
+    email TEXT,
+    id_number TEXT,
+    notes TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await q(`CREATE TABLE IF NOT EXISTS stays (
+    id BIGSERIAL PRIMARY KEY,
+    booking_code TEXT UNIQUE NOT NULL,
+    unit_id BIGINT NOT NULL REFERENCES units(id) ON DELETE RESTRICT,
+    guest_id BIGINT NOT NULL REFERENCES guests(id) ON DELETE RESTRICT,
+    check_in DATE NOT NULL,
+    check_out DATE NOT NULL,
+    nightly_rate NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK(nightly_rate >= 0),
+    nights INT NOT NULL DEFAULT 1 CHECK(nights >= 1),
+    cleaning_fee NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK(cleaning_fee >= 0),
+    deposit NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK(deposit >= 0),
+    channel TEXT NOT NULL DEFAULT 'direct',
+    payment_status TEXT NOT NULL DEFAULT 'unpaid' CHECK(payment_status IN ('unpaid','partial','paid','refunded')),
+    status TEXT NOT NULL DEFAULT 'reserved' CHECK(status IN ('reserved','checked_in','checked_out','cancelled')),
+    total_amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+    notes TEXT,
+    created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK(check_out > check_in)
+  )`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_stays_dates ON stays(check_in, check_out)`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_stays_unit_dates ON stays(unit_id, check_in, check_out)`);
 
   const email = (process.env.ADMIN_EMAIL || 'admin@rentbook.local').toLowerCase().trim();
   const password = process.env.ADMIN_PASSWORD || 'ChangeMe123!';
@@ -269,6 +302,41 @@ app.delete('/api/payments/:id',asyncHandler(async(req,res)=>{const id=validId(re
 app.get('/api/expenses',asyncHandler(async(req,res)=>{res.json(await q(`SELECT e.*,a.name apartment_name,u.unit_code FROM expenses e LEFT JOIN apartments a ON a.id=e.apartment_id LEFT JOIN units u ON u.id=e.unit_id ORDER BY e.expense_date DESC,e.id DESC`));}));
 app.post('/api/expenses',asyncHandler(async(req,res)=>{const b=req.body;const r=await one(`INSERT INTO expenses(apartment_id,unit_id,expense_date,category,amount,vendor,description,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,[b.apartment_id?validId(b.apartment_id,'apartment_id'):null,b.unit_id?validId(b.unit_id,'unit_id'):null,dateSchema.parse(b.expense_date),clean(b.category),moneySchema.parse(b.amount),clean(b.vendor)||null,clean(b.description)||null,req.session.user.id]);await audit(req.session.user.id,'CREATE','expense',r.id,r);res.status(201).json(r);}));
 app.delete('/api/expenses/:id',asyncHandler(async(req,res)=>{const id=validId(req.params.id,'id');await q(`DELETE FROM expenses WHERE id=$1`,[id]);await audit(req.session.user.id,'DELETE','expense',id);res.json({ok:true});}));
+
+app.get('/api/guests',asyncHandler(async(req,res)=>{
+  res.json(await q(`SELECT g.*,COUNT(s.id)::int stay_count FROM guests g LEFT JOIN stays s ON s.guest_id=g.id GROUP BY g.id ORDER BY g.id DESC`));
+}));
+app.post('/api/guests',asyncHandler(async(req,res)=>{const b=req.body;if(!clean(b.name))return res.status(400).json({error:'Nama tamu wajib'});const r=await one(`INSERT INTO guests(name,phone,email,id_number,notes) VALUES($1,$2,$3,$4,$5) RETURNING *`,[clean(b.name),clean(b.phone)||null,clean(b.email)||null,clean(b.id_number)||null,clean(b.notes)||null]);await audit(req.session.user.id,'CREATE','guest',r.id,r);res.status(201).json(r);}));
+app.put('/api/guests/:id',asyncHandler(async(req,res)=>{const id=validId(req.params.id,'id'),b=req.body;const r=await one(`UPDATE guests SET name=$1,phone=$2,email=$3,id_number=$4,notes=$5,updated_at=NOW() WHERE id=$6 RETURNING *`,[clean(b.name),clean(b.phone)||null,clean(b.email)||null,clean(b.id_number)||null,clean(b.notes)||null,id]);if(!r)return res.status(404).json({error:'Tidak ditemukan'});await audit(req.session.user.id,'UPDATE','guest',id,r);res.json(r);}));
+app.delete('/api/guests/:id',asyncHandler(async(req,res)=>{const id=validId(req.params.id,'id');await q(`DELETE FROM guests WHERE id=$1`,[id]);await audit(req.session.user.id,'DELETE','guest',id);res.json({ok:true});}));
+
+app.get('/api/stays',asyncHandler(async(req,res)=>{
+  const month=req.query.month&&/^\d{4}-\d{2}$/.test(req.query.month)?req.query.month:null;
+  const where=[];const params=[];
+  if(month){params.push(`${month}-01`);where.push(`s.check_in < (date_trunc('month',$1::date) + interval '1 month') AND s.check_out > date_trunc('month',$1::date)`);}
+  const cond=where.length?'WHERE '+where.join(' AND '):'';
+  res.json(await q(`SELECT s.*,u.unit_code,a.name apartment_name,g.name guest_name,g.phone guest_phone FROM stays s JOIN units u ON u.id=s.unit_id JOIN apartments a ON a.id=u.apartment_id JOIN guests g ON g.id=s.guest_id ${cond} ORDER BY s.check_in,s.unit_id,s.id`,params));
+}));
+app.post('/api/stays',asyncHandler(async(req,res)=>{
+  const b=req.body, unitId=validId(b.unit_id,'unit_id'), guestId=validId(b.guest_id,'guest_id');
+  const checkIn=dateSchema.parse(b.check_in), checkOut=dateSchema.parse(b.check_out);
+  const nightly=moneySchema.parse(b.nightly_rate||0), cleanFee=moneySchema.parse(b.cleaning_fee||0), dep=moneySchema.parse(b.deposit||0);
+  const d1=new Date(`${checkIn}T00:00:00Z`),d2=new Date(`${checkOut}T00:00:00Z`);const nights=Math.max(1,Math.round((d2-d1)/86400000));
+  const total=(nightly*nights)+cleanFee; const code=clean(b.booking_code)||`ST-${new Date().toISOString().slice(0,10).replaceAll('-','')}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
+  const overlap=await one(`SELECT id FROM stays WHERE unit_id=$1 AND status<>'cancelled' AND check_in < $3 AND check_out > $2 LIMIT 1`,[unitId,checkOut,checkIn]);
+  if(overlap)return res.status(409).json({error:'Unit sudah terbooking pada tanggal tersebut'});
+  const r=await one(`INSERT INTO stays(booking_code,unit_id,guest_id,check_in,check_out,nightly_rate,nights,cleaning_fee,deposit,channel,payment_status,status,total_amount,notes,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,[code,unitId,guestId,checkIn,checkOut,nightly,nights,cleanFee,dep,clean(b.channel)||'direct',b.payment_status||'unpaid',b.status||'reserved',total,clean(b.notes)||null,req.session.user.id]);
+  await q(`UPDATE units SET status=CASE WHEN $2='checked_in' THEN 'occupied' WHEN $2='reserved' THEN 'reserved' ELSE status END,updated_at=NOW() WHERE id=$1`,[unitId,b.status||'reserved']);
+  await audit(req.session.user.id,'CREATE','stay',r.id,r);res.status(201).json(r);
+}));
+app.put('/api/stays/:id',asyncHandler(async(req,res)=>{
+  const id=validId(req.params.id,'id'),b=req.body,unitId=validId(b.unit_id,'unit_id'),guestId=validId(b.guest_id,'guest_id');
+  const checkIn=dateSchema.parse(b.check_in),checkOut=dateSchema.parse(b.check_out);const d1=new Date(`${checkIn}T00:00:00Z`),d2=new Date(`${checkOut}T00:00:00Z`);const nights=Math.max(1,Math.round((d2-d1)/86400000));
+  const nightly=moneySchema.parse(b.nightly_rate||0),cleanFee=moneySchema.parse(b.cleaning_fee||0),dep=moneySchema.parse(b.deposit||0),total=(nightly*nights)+cleanFee;
+  const overlap=await one(`SELECT id FROM stays WHERE unit_id=$1 AND id<>$2 AND status<>'cancelled' AND check_in < $4 AND check_out > $3 LIMIT 1`,[unitId,id,checkIn,checkOut]);if(overlap)return res.status(409).json({error:'Unit sudah terbooking pada tanggal tersebut'});
+  const r=await one(`UPDATE stays SET booking_code=$1,unit_id=$2,guest_id=$3,check_in=$4,check_out=$5,nightly_rate=$6,nights=$7,cleaning_fee=$8,deposit=$9,channel=$10,payment_status=$11,status=$12,total_amount=$13,notes=$14,updated_at=NOW() WHERE id=$15 RETURNING *`,[clean(b.booking_code),unitId,guestId,checkIn,checkOut,nightly,nights,cleanFee,dep,clean(b.channel)||'direct',b.payment_status||'unpaid',b.status||'reserved',total,clean(b.notes)||null,id]);if(!r)return res.status(404).json({error:'Tidak ditemukan'});await audit(req.session.user.id,'UPDATE','stay',id,r);res.json(r);
+}));
+app.delete('/api/stays/:id',asyncHandler(async(req,res)=>{const id=validId(req.params.id,'id');const stay=await one(`SELECT unit_id FROM stays WHERE id=$1`,[id]);await q(`DELETE FROM stays WHERE id=$1`,[id]);if(stay)await q(`UPDATE units SET status='available' WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM stays WHERE unit_id=$1 AND status IN ('reserved','checked_in') AND check_out>CURRENT_DATE) AND NOT EXISTS(SELECT 1 FROM leases WHERE unit_id=$1 AND status='active')`,[stay.unit_id]);await audit(req.session.user.id,'DELETE','stay',id);res.json({ok:true});}));
 
 app.get('/api/dashboard',asyncHandler(async(req,res)=>{
   const from=req.query.from&&/^\d{4}-\d{2}-\d{2}$/.test(req.query.from)?req.query.from:null;
