@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
@@ -108,7 +108,6 @@ async function initDb() {
     id BIGSERIAL PRIMARY KEY,
     apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
     unit_code TEXT NOT NULL,
-    floor TEXT,
     type TEXT,
     status TEXT NOT NULL DEFAULT 'available' CHECK (status IN ('available','occupied','maintenance','reserved')),
     monthly_target NUMERIC(14,2) NOT NULL DEFAULT 0,
@@ -117,6 +116,8 @@ async function initDb() {
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(apartment_id, unit_code)
   )`);
+  await q(`ALTER TABLE units DROP COLUMN IF EXISTS floor`);
+  await q(`ALTER TABLE units DROP COLUMN IF EXISTS tower`);
   await q(`CREATE TABLE IF NOT EXISTS tenants (
     id BIGSERIAL PRIMARY KEY,
     name TEXT NOT NULL,
@@ -279,10 +280,32 @@ app.delete('/api/apartments/:id', asyncHandler(async(req,res)=>{const id=validId
 
 app.get('/api/units', asyncHandler(async(req,res)=>{
   const apartmentId=req.query.apartment_id?validId(req.query.apartment_id,'apartment_id'):null;
-  res.json(await q(`SELECT u.*,a.name apartment_name, t.name tenant_name, l.monthly_rent active_rent, l.end_date lease_end FROM units u JOIN apartments a ON a.id=u.apartment_id LEFT JOIN leases l ON l.unit_id=u.id AND l.status='active' LEFT JOIN tenants t ON t.id=l.tenant_id ${apartmentId?'WHERE u.apartment_id=$1':''} ORDER BY a.name,u.unit_code`,apartmentId?[apartmentId]:[]));
+  res.json(await q(`SELECT u.id,u.apartment_id,u.unit_code,u.type,u.status,u.monthly_target,u.notes,u.created_at,u.updated_at,a.name apartment_name,t.name tenant_name,l.monthly_rent active_rent,l.end_date lease_end FROM units u JOIN apartments a ON a.id=u.apartment_id LEFT JOIN leases l ON l.unit_id=u.id AND l.status='active' LEFT JOIN tenants t ON t.id=l.tenant_id ${apartmentId?'WHERE u.apartment_id=$1':''} ORDER BY a.name,u.unit_code`,apartmentId?[apartmentId]:[]));
 }));
-app.post('/api/units', asyncHandler(async(req,res)=>{const b=req.body; const r=await one(`INSERT INTO units(apartment_id,unit_code,floor,type,status,monthly_target,notes) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[validId(b.apartment_id,'apartment_id'),clean(b.unit_code),clean(b.floor)||null,clean(b.type)||null,b.status||'available',moneySchema.parse(b.monthly_target||0),clean(b.notes)||null]); await audit(req.session.user.id,'CREATE','unit',r.id,r); res.status(201).json(r);}));
-app.put('/api/units/:id', asyncHandler(async(req,res)=>{const id=validId(req.params.id,'id'),b=req.body; const r=await one(`UPDATE units SET apartment_id=$1,unit_code=$2,floor=$3,type=$4,status=$5,monthly_target=$6,notes=$7,updated_at=NOW() WHERE id=$8 RETURNING *`,[validId(b.apartment_id,'apartment_id'),clean(b.unit_code),clean(b.floor)||null,clean(b.type)||null,b.status,moneySchema.parse(b.monthly_target||0),clean(b.notes)||null,id]); if(!r)return res.status(404).json({error:'Tidak ditemukan'}); await audit(req.session.user.id,'UPDATE','unit',id,r); res.json(r);}));
+app.post('/api/units', asyncHandler(async(req,res)=>{
+  const b=req.body;
+  const apartmentId=validId(b.apartment_id,'apartment_id');
+  const unitCode=clean(b.unit_code);
+  if(!unitCode)return res.status(400).json({error:'Kode unit wajib diisi'});
+  try{
+    const r=await one(`INSERT INTO units(apartment_id,unit_code,type,status,monthly_target,notes) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[apartmentId,unitCode,clean(b.type)||'Studio',b.status||'available',moneySchema.parse(b.monthly_target||0),clean(b.notes)||null]);
+    await audit(req.session.user.id,'CREATE','unit',r.id,r);
+    res.status(201).json(r);
+  }catch(e){if(e.code==='23505')return res.status(409).json({error:'Kode unit sudah digunakan pada property tersebut'});throw e;}
+}));
+app.put('/api/units/:id', asyncHandler(async(req,res)=>{
+  const id=validId(req.params.id,'id');
+  const b=req.body;
+  const apartmentId=validId(b.apartment_id,'apartment_id');
+  const unitCode=clean(b.unit_code);
+  if(!unitCode)return res.status(400).json({error:'Kode unit wajib diisi'});
+  try{
+    const r=await one(`UPDATE units SET apartment_id=$1,unit_code=$2,type=$3,status=$4,monthly_target=$5,notes=$6,updated_at=NOW() WHERE id=$7 RETURNING *`,[apartmentId,unitCode,clean(b.type)||'Studio',b.status||'available',moneySchema.parse(b.monthly_target||0),clean(b.notes)||null,id]);
+    if(!r)return res.status(404).json({error:'Unit tidak ditemukan'});
+    await audit(req.session.user.id,'UPDATE','unit',id,r);
+    res.json(r);
+  }catch(e){if(e.code==='23505')return res.status(409).json({error:'Kode unit sudah digunakan pada property tersebut'});throw e;}
+}));
 app.delete('/api/units/:id', asyncHandler(async(req,res)=>{const id=validId(req.params.id,'id'); await q(`DELETE FROM units WHERE id=$1`,[id]); await audit(req.session.user.id,'DELETE','unit',id); res.json({ok:true});}));
 
 app.get('/api/tenants', asyncHandler(async(req,res)=>{res.json(await q(`SELECT t.*, COUNT(l.id)::int lease_count FROM tenants t LEFT JOIN leases l ON l.tenant_id=t.id GROUP BY t.id ORDER BY t.id DESC`));}));
@@ -351,7 +374,7 @@ app.get('/api/dashboard',asyncHandler(async(req,res)=>{
     one(`SELECT COUNT(*) value FROM units`),
     one(`SELECT COUNT(*) value FROM units WHERE status='occupied'`),
     one(`SELECT COALESCE(SUM(GREATEST(l.monthly_rent - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.lease_id=l.id AND p.period_month=DATE_TRUNC('month', CURRENT_DATE)),0),0)),0) value FROM leases l WHERE l.status='active'`),
-    q(`SELECT TO_CHAR(DATE_TRUNC('month',payment_date),'YYYY-MM') "month",COALESCE(SUM(amount),0) value FROM payments GROUP BY 1 ORDER BY 1 DESC LIMIT 12`),
+    q(`SELECT TO_CHAR(DATE_TRUNC('month',payment_date),'YYYY-MM') month,COALESCE(SUM(amount),0) value FROM payments GROUP BY 1 ORDER BY 1 DESC LIMIT 12`),
     q(`SELECT a.name,SUM(u.monthly_target) target,COUNT(*) units,COUNT(*) FILTER(WHERE u.status='occupied') occupied FROM apartments a LEFT JOIN units u ON u.apartment_id=a.id GROUP BY a.id ORDER BY a.name`)
   ]);
   res.json({income:Number(income.value),expense:Number(expense.value),profit:Number(income.value)-Number(expense.value),units:Number(units.value),occupied:Number(active.value),occupancy:Number(units.value)?Number(active.value)/Number(units.value)*100:0,arrears:Number(arrears.value),monthly,byApartment});
@@ -359,7 +382,7 @@ app.get('/api/dashboard',asyncHandler(async(req,res)=>{
 
 app.get('/api/reports/monthly',asyncHandler(async(req,res)=>{
   res.json(await q(`WITH months AS (SELECT DATE_TRUNC('month',CURRENT_DATE) - (n||' month')::interval m FROM generate_series(0,11) n)
-  SELECT TO_CHAR(months.m,'YYYY-MM') "month",
+  SELECT TO_CHAR(months.m,'YYYY-MM') month,
   COALESCE((SELECT SUM(p.amount) FROM payments p WHERE DATE_TRUNC('month',p.payment_date)=months.m),0) income,
   COALESCE((SELECT SUM(e.amount) FROM expenses e WHERE DATE_TRUNC('month',e.expense_date)=months.m),0) expense
   FROM months ORDER BY months.m DESC`));
@@ -380,4 +403,3 @@ app.get(/.*/,(req,res)=>res.sendFile(path.join(__dirname,'public','index.html'))
 app.use((err,req,res,next)=>{console.error(err);const msg=err?.code==='23505'?'Data duplikat / konflik':err?.message||'Server error';res.status(400).json({error:msg});});
 
 initDb().then(()=>app.listen(PORT,()=>console.log(`RentBook running on port ${PORT}`))).catch(err=>{console.error('DB init failed',err);process.exit(1);});
-
