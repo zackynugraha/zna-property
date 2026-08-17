@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
@@ -351,7 +351,7 @@ app.get('/api/dashboard',asyncHandler(async(req,res)=>{
     one(`SELECT COUNT(*) value FROM units`),
     one(`SELECT COUNT(*) value FROM units WHERE status='occupied'`),
     one(`SELECT COALESCE(SUM(GREATEST(l.monthly_rent - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.lease_id=l.id AND p.period_month=DATE_TRUNC('month', CURRENT_DATE)),0),0)),0) value FROM leases l WHERE l.status='active'`),
-    q(`SELECT TO_CHAR(DATE_TRUNC('month',payment_date),'YYYY-MM') month,COALESCE(SUM(amount),0) value FROM payments GROUP BY 1 ORDER BY 1 DESC LIMIT 12`),
+    q(`SELECT TO_CHAR(DATE_TRUNC('month',payment_date),'YYYY-MM') "month",COALESCE(SUM(amount),0) value FROM payments GROUP BY 1 ORDER BY 1 DESC LIMIT 12`),
     q(`SELECT a.name,SUM(u.monthly_target) target,COUNT(*) units,COUNT(*) FILTER(WHERE u.status='occupied') occupied FROM apartments a LEFT JOIN units u ON u.apartment_id=a.id GROUP BY a.id ORDER BY a.name`)
   ]);
   res.json({income:Number(income.value),expense:Number(expense.value),profit:Number(income.value)-Number(expense.value),units:Number(units.value),occupied:Number(active.value),occupancy:Number(units.value)?Number(active.value)/Number(units.value)*100:0,arrears:Number(arrears.value),monthly,byApartment});
@@ -359,7 +359,7 @@ app.get('/api/dashboard',asyncHandler(async(req,res)=>{
 
 app.get('/api/reports/monthly',asyncHandler(async(req,res)=>{
   res.json(await q(`WITH months AS (SELECT DATE_TRUNC('month',CURRENT_DATE) - (n||' month')::interval m FROM generate_series(0,11) n)
-  SELECT TO_CHAR(months.m,'YYYY-MM') month,
+  SELECT TO_CHAR(months.m,'YYYY-MM') "month",
   COALESCE((SELECT SUM(p.amount) FROM payments p WHERE DATE_TRUNC('month',p.payment_date)=months.m),0) income,
   COALESCE((SELECT SUM(e.amount) FROM expenses e WHERE DATE_TRUNC('month',e.expense_date)=months.m),0) expense
   FROM months ORDER BY months.m DESC`));
@@ -380,3 +380,4 @@ app.get(/.*/,(req,res)=>res.sendFile(path.join(__dirname,'public','index.html'))
 app.use((err,req,res,next)=>{console.error(err);const msg=err?.code==='23505'?'Data duplikat / konflik':err?.message||'Server error';res.status(400).json({error:msg});});
 
 initDb().then(()=>app.listen(PORT,()=>console.log(`RentBook running on port ${PORT}`))).catch(err=>{console.error('DB init failed',err);process.exit(1);});
+
