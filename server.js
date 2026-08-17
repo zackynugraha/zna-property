@@ -69,6 +69,11 @@ function auth(req, res, next) {
   next();
 }
 
+function adminOnly(req, res, next) {
+  if (req.session.user?.role !== 'admin') return res.status(403).json({ error: 'Akun viewer hanya dapat melihat data. Hubungi admin untuk melakukan perubahan.' });
+  next();
+}
+
 function csrf(req, res, next) {
   const token = req.get('x-csrf-token');
   if (!req.session.csrfToken || token !== req.session.csrfToken) return res.status(403).json({ error: 'Invalid CSRF token' });
@@ -213,6 +218,43 @@ async function initDb() {
   await q(`CREATE INDEX IF NOT EXISTS idx_stays_dates ON stays(check_in, check_out)`);
   await q(`CREATE INDEX IF NOT EXISTS idx_stays_unit_dates ON stays(unit_id, check_in, check_out)`);
 
+  await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'viewer'`);
+  await q(`CREATE TABLE IF NOT EXISTS apartment_leases (
+    id BIGSERIAL PRIMARY KEY,
+    apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+    landlord_name TEXT,
+    start_date DATE NOT NULL,
+    end_date DATE,
+    monthly_rent NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK(monthly_rent >= 0),
+    deposit NUMERIC(14,2) NOT NULL DEFAULT 0 CHECK(deposit >= 0),
+    payment_day INT NOT NULL DEFAULT 1 CHECK(payment_day BETWEEN 1 AND 28),
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','ended','upcoming')),
+    notes TEXT,
+    created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await q(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_apartment_lease ON apartment_leases(apartment_id) WHERE status='active'`);
+  await q(`CREATE TABLE IF NOT EXISTS property_partners (
+    id BIGSERIAL PRIMARY KEY,
+    apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+    user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    partner_name TEXT NOT NULL,
+    share_percent NUMERIC(5,2) NOT NULL CHECK(share_percent > 0 AND share_percent <= 100),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_property_partners_apartment ON property_partners(apartment_id)`);
+  await q(`CREATE TABLE IF NOT EXISTS stay_payments (
+    id BIGSERIAL PRIMARY KEY,
+    stay_id BIGINT NOT NULL REFERENCES stays(id) ON DELETE CASCADE,
+    payment_date DATE NOT NULL,
+    amount NUMERIC(14,2) NOT NULL CHECK(amount >= 0),
+    payment_method TEXT NOT NULL DEFAULT 'bank_transfer',
+    reference TEXT,
+    created_by BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
   const email = (process.env.ADMIN_EMAIL || 'admin@rentbook.local').toLowerCase().trim();
   const password = process.env.ADMIN_PASSWORD || 'ChangeMe123!';
   const existing = await one(`SELECT id FROM users WHERE email=$1`, [email]);
@@ -361,6 +403,121 @@ app.put('/api/stays/:id',asyncHandler(async(req,res)=>{
 }));
 app.delete('/api/stays/:id',asyncHandler(async(req,res)=>{const id=validId(req.params.id,'id');const stay=await one(`SELECT unit_id FROM stays WHERE id=$1`,[id]);await q(`DELETE FROM stays WHERE id=$1`,[id]);if(stay)await q(`UPDATE units SET status='available' WHERE id=$1 AND NOT EXISTS(SELECT 1 FROM stays WHERE unit_id=$1 AND status IN ('reserved','checked_in') AND check_out>CURRENT_DATE) AND NOT EXISTS(SELECT 1 FROM leases WHERE unit_id=$1 AND status='active')`,[stay.unit_id]);await audit(req.session.user.id,'DELETE','stay',id);res.json({ok:true});}));
 
+
+// --- Property business model: master lease + partner shares ---
+app.get('/api/property-financials', asyncHandler(async(req,res)=>{
+  const rows=await q(`
+    SELECT a.id,a.name,a.city,a.address,
+      COALESCE(al.monthly_rent,0) monthly_rent,
+      al.start_date master_start,al.end_date master_end,al.status master_status,
+      COALESCE((SELECT json_agg(pp ORDER BY pp.id) FROM property_partners pp WHERE pp.apartment_id=a.id),'[]') partners,
+      COALESCE((SELECT COUNT(*) FROM units u WHERE u.apartment_id=a.id),0)::int unit_count
+    FROM apartments a
+    LEFT JOIN apartment_leases al ON al.apartment_id=a.id AND al.status='active'
+    ORDER BY a.name`);
+  res.json(rows);
+}));
+
+app.get('/api/apartment-leases', asyncHandler(async(req,res)=>{
+  res.json(await q(`SELECT al.*,a.name apartment_name FROM apartment_leases al JOIN apartments a ON a.id=al.apartment_id ORDER BY al.id DESC`));
+}));
+app.post('/api/apartment-leases', asyncHandler(async(req,res)=>{
+  const b=req.body, apartmentId=validId(b.apartment_id,'apartment_id');
+  const start=dateSchema.parse(b.start_date);
+  const end=b.end_date?dateSchema.parse(b.end_date):null;
+  const rent=moneySchema.parse(b.monthly_rent||0), dep=moneySchema.parse(b.deposit||0);
+  const day=Math.min(28,Math.max(1,Number(b.payment_day||1)));
+  if(b.status==='active') await q(`UPDATE apartment_leases SET status='ended',updated_at=NOW() WHERE apartment_id=$1 AND status='active'`,[apartmentId]);
+  const r=await one(`INSERT INTO apartment_leases(apartment_id,landlord_name,start_date,end_date,monthly_rent,deposit,payment_day,status,notes,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+    [apartmentId,clean(b.landlord_name)||null,start,end,rent,dep,day,clean(b.status)||'active',clean(b.notes)||null,req.session.user.id]);
+  await audit(req.session.user.id,'CREATE','apartment_lease',r.id,r);res.status(201).json(r);
+}));
+app.put('/api/apartment-leases/:id', asyncHandler(async(req,res)=>{
+  const id=validId(req.params.id,'id'),b=req.body, apartmentId=validId(b.apartment_id,'apartment_id');
+  const start=dateSchema.parse(b.start_date),end=b.end_date?dateSchema.parse(b.end_date):null;
+  const rent=moneySchema.parse(b.monthly_rent||0),dep=moneySchema.parse(b.deposit||0),day=Math.min(28,Math.max(1,Number(b.payment_day||1)));
+  if(b.status==='active') await q(`UPDATE apartment_leases SET status='ended',updated_at=NOW() WHERE apartment_id=$1 AND status='active' AND id<>$2`,[apartmentId,id]);
+  const r=await one(`UPDATE apartment_leases SET apartment_id=$1,landlord_name=$2,start_date=$3,end_date=$4,monthly_rent=$5,deposit=$6,payment_day=$7,status=$8,notes=$9,updated_at=NOW() WHERE id=$10 RETURNING *`,
+    [apartmentId,clean(b.landlord_name)||null,start,end,rent,dep,day,clean(b.status)||'active',clean(b.notes)||null,id]);
+  if(!r)return res.status(404).json({error:'Kontrak tidak ditemukan'});
+  await audit(req.session.user.id,'UPDATE','apartment_lease',id,r);res.json(r);
+}));
+app.delete('/api/apartment-leases/:id',asyncHandler(async(req,res)=>{
+  const id=validId(req.params.id,'id');await q(`DELETE FROM apartment_leases WHERE id=$1`,[id]);await audit(req.session.user.id,'DELETE','apartment_lease',id);res.json({ok:true});
+}));
+
+app.get('/api/property-partners',asyncHandler(async(req,res)=>{
+  res.json(await q(`SELECT pp.*,a.name apartment_name,u.email user_email FROM property_partners pp JOIN apartments a ON a.id=pp.apartment_id LEFT JOIN users u ON u.id=pp.user_id ORDER BY a.name,pp.id`));
+}));
+app.post('/api/property-partners',asyncHandler(async(req,res)=>{
+  const b=req.body, apartmentId=validId(b.apartment_id,'apartment_id'),share=Number(b.share_percent);
+  if(!clean(b.partner_name)||!Number.isFinite(share)||share<=0||share>100)return res.status(400).json({error:'Nama partner dan persentase wajib valid'});
+  const total=await one(`SELECT COALESCE(SUM(share_percent),0) value FROM property_partners WHERE apartment_id=$1`,[apartmentId]);
+  if(Number(total.value)+share>100.001)return res.status(400).json({error:'Total porsi partner dalam satu property tidak boleh lebih dari 100%'});
+  const userId=b.user_id?validId(b.user_id,'user_id'):null;
+  const r=await one(`INSERT INTO property_partners(apartment_id,user_id,partner_name,share_percent) VALUES($1,$2,$3,$4) RETURNING *`,[apartmentId,userId,clean(b.partner_name),share]);
+  await audit(req.session.user.id,'CREATE','property_partner',r.id,r);res.status(201).json(r);
+}));
+app.put('/api/property-partners/:id',asyncHandler(async(req,res)=>{
+  const id=validId(req.params.id,'id'),b=req.body,apartmentId=validId(b.apartment_id,'apartment_id'),share=Number(b.share_percent);
+  if(!clean(b.partner_name)||!Number.isFinite(share)||share<=0||share>100)return res.status(400).json({error:'Data partner tidak valid'});
+  const total=await one(`SELECT COALESCE(SUM(share_percent),0) value FROM property_partners WHERE apartment_id=$1 AND id<>$2`,[apartmentId,id]);
+  if(Number(total.value)+share>100.001)return res.status(400).json({error:'Total porsi partner tidak boleh lebih dari 100%'});
+  const userId=b.user_id?validId(b.user_id,'user_id'):null;
+  const r=await one(`UPDATE property_partners SET apartment_id=$1,user_id=$2,partner_name=$3,share_percent=$4,updated_at=NOW() WHERE id=$5 RETURNING *`,[apartmentId,userId,clean(b.partner_name),share,id]);
+  if(!r)return res.status(404).json({error:'Partner tidak ditemukan'});
+  await audit(req.session.user.id,'UPDATE','property_partner',id,r);res.json(r);
+}));
+app.delete('/api/property-partners/:id',asyncHandler(async(req,res)=>{const id=validId(req.params.id,'id');await q(`DELETE FROM property_partners WHERE id=$1`,[id]);await audit(req.session.user.id,'DELETE','property_partner',id);res.json({ok:true});}));
+
+// --- Role / account management ---
+app.get('/api/users',asyncHandler(async(req,res)=>{
+  if(req.session.user.role!=='admin')return res.status(403).json({error:'Forbidden'});
+  res.json(await q(`SELECT id,email,name,role,created_at FROM users ORDER BY name,email`));
+}));
+app.post('/api/users',asyncHandler(async(req,res)=>{
+  const b=req.body,email=clean(b.email)?.toLowerCase(),name=clean(b.name),role=b.role==='admin'?'admin':'viewer';
+  if(!email||!name||!b.password||String(b.password).length<8)return res.status(400).json({error:'Nama, email, dan password minimal 8 karakter wajib diisi'});
+  const hash=await bcrypt.hash(String(b.password),12);
+  try{
+    const r=await one(`INSERT INTO users(email,password_hash,name,role) VALUES($1,$2,$3,$4) RETURNING id,email,name,role`,[email,hash,name,role]);
+    await audit(req.session.user.id,'CREATE','user',r.id,r);res.status(201).json(r);
+  }catch(e){if(e.code==='23505')return res.status(409).json({error:'Email akun sudah digunakan'});throw e;}
+}));
+app.put('/api/users/:id',asyncHandler(async(req,res)=>{
+  const id=validId(req.params.id,'id'),b=req.body,role=b.role==='admin'?'admin':'viewer';
+  if(id===Number(req.session.user.id) && role!=='admin')return res.status(400).json({error:'Akun admin yang sedang digunakan tidak boleh diubah menjadi viewer'});
+  const fields=[],vals=[];
+  fields.push('name=$1');vals.push(clean(b.name)||'User');
+  fields.push('role=$2');vals.push(role);
+  if(b.password){if(String(b.password).length<8)return res.status(400).json({error:'Password minimal 8 karakter'});fields.push('password_hash=$3');vals.push(await bcrypt.hash(String(b.password),12));}
+  vals.push(id);
+  const r=await one(`UPDATE users SET ${fields.join(',')},updated_at=NOW() WHERE id=$${vals.length} RETURNING id,email,name,role`,vals);
+  if(!r)return res.status(404).json({error:'User tidak ditemukan'});
+  await audit(req.session.user.id,'UPDATE','user',id,r);res.json(r);
+}));
+app.delete('/api/users/:id',asyncHandler(async(req,res)=>{
+  const id=validId(req.params.id,'id');if(id===Number(req.session.user.id))return res.status(400).json({error:'Akun yang sedang login tidak dapat dihapus'});
+  await q(`DELETE FROM users WHERE id=$1`,[id]);await audit(req.session.user.id,'DELETE','user',id);res.json({ok:true});
+}));
+
+app.get('/api/stay-payments',asyncHandler(async(req,res)=>{
+  res.json(await q(`SELECT sp.*,s.booking_code,g.name guest_name,u.unit_code,a.name apartment_name FROM stay_payments sp JOIN stays s ON s.id=sp.stay_id JOIN guests g ON g.id=s.guest_id JOIN units u ON u.id=s.unit_id JOIN apartments a ON a.id=u.apartment_id ORDER BY sp.payment_date DESC,sp.id DESC`));
+}));
+app.post('/api/stay-payments',asyncHandler(async(req,res)=>{
+  const b=req.body,stayId=validId(b.stay_id,'stay_id'),amount=moneySchema.parse(b.amount||0);
+  const r=await one(`INSERT INTO stay_payments(stay_id,payment_date,amount,payment_method,reference,created_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,[stayId,dateSchema.parse(b.payment_date||new Date().toISOString().slice(0,10)),amount,clean(b.payment_method)||'bank_transfer',clean(b.reference)||null,req.session.user.id]);
+  const total=await one(`SELECT total_amount FROM stays WHERE id=$1`,[stayId]),paid=await one(`SELECT COALESCE(SUM(amount),0) value FROM stay_payments WHERE stay_id=$1`,[stayId]);
+  const status=Number(paid.value)>=Number(total.total_amount)?'paid':Number(paid.value)>0?'partial':'unpaid';
+  await q(`UPDATE stays SET payment_status=$2,updated_at=NOW() WHERE id=$1`,[stayId,status]);
+  await audit(req.session.user.id,'CREATE','stay_payment',r.id,r);res.status(201).json(r);
+}));
+app.delete('/api/stay-payments/:id',asyncHandler(async(req,res)=>{
+  const id=validId(req.params.id,'id'),p=await one(`SELECT stay_id FROM stay_payments WHERE id=$1`,[id]);await q(`DELETE FROM stay_payments WHERE id=$1`,[id]);
+  if(p){const paid=await one(`SELECT COALESCE(SUM(amount),0) value FROM stay_payments WHERE stay_id=$1`,[p.stay_id]),t=await one(`SELECT total_amount FROM stays WHERE id=$1`,[p.stay_id]);const status=Number(paid.value)>=Number(t.total_amount)?'paid':Number(paid.value)>0?'partial':'unpaid';await q(`UPDATE stays SET payment_status=$2 WHERE id=$1`,[p.stay_id,status]);}
+  await audit(req.session.user.id,'DELETE','stay_payment',id);res.json({ok:true});
+}));
+
 app.get('/api/dashboard',asyncHandler(async(req,res)=>{
   const from=req.query.from&&/^\d{4}-\d{2}-\d{2}$/.test(req.query.from)?req.query.from:null;
   const to=req.query.to&&/^\d{4}-\d{2}-\d{2}$/.test(req.query.to)?req.query.to:null;
@@ -368,16 +525,18 @@ app.get('/api/dashboard',asyncHandler(async(req,res)=>{
   if(from){payWhere.push(`payment_date >= $${payParams.length+1}`);payParams.push(from);expWhere.push(`expense_date >= $${expParams.length+1}`);expParams.push(from);}
   if(to){payWhere.push(`payment_date <= $${payParams.length+1}`);payParams.push(to);expWhere.push(`expense_date <= $${expParams.length+1}`);expParams.push(to);}
   const payCondition=payWhere.length?'WHERE '+payWhere.join(' AND '):''; const expCondition=expWhere.length?'WHERE '+expWhere.join(' AND '):'';
-  const [income,expense,units,active,arrears,monthly,byApartment] = await Promise.all([
-    one(`SELECT COALESCE(SUM(amount),0) value FROM payments ${payCondition}`,payParams),
+  const [income,expense,masterRent,units,active,arrears,monthly,byApartment] = await Promise.all([
+    one(`SELECT COALESCE(SUM(s.total_amount),0) value FROM stays s WHERE s.status <> 'cancelled' ${from?`AND s.check_out >= $1`:''} ${to?`AND s.check_in <= $${from?2:1}`:''}`, from&&to?[from,to]:from?[from]:to?[to]:[]),
     one(`SELECT COALESCE(SUM(amount),0) value FROM expenses ${expCondition}`,expParams),
+    one(`SELECT COALESCE(SUM(monthly_rent),0) value FROM apartment_leases WHERE status='active'`),
     one(`SELECT COUNT(*) value FROM units`),
     one(`SELECT COUNT(*) value FROM units WHERE status='occupied'`),
     one(`SELECT COALESCE(SUM(GREATEST(l.monthly_rent - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.lease_id=l.id AND p.period_month=DATE_TRUNC('month', CURRENT_DATE)),0),0)),0) value FROM leases l WHERE l.status='active'`),
     q(`SELECT TO_CHAR(DATE_TRUNC('month',payment_date),'YYYY-MM') AS "month",COALESCE(SUM(amount),0) value FROM payments GROUP BY 1 ORDER BY 1 DESC LIMIT 12`),
     q(`SELECT a.name,SUM(u.monthly_target) target,COUNT(*) units,COUNT(*) FILTER(WHERE u.status='occupied') occupied FROM apartments a LEFT JOIN units u ON u.apartment_id=a.id GROUP BY a.id ORDER BY a.name`)
   ]);
-  res.json({income:Number(income.value),expense:Number(expense.value),profit:Number(income.value)-Number(expense.value),units:Number(units.value),occupied:Number(active.value),occupancy:Number(units.value)?Number(active.value)/Number(units.value)*100:0,arrears:Number(arrears.value),monthly,byApartment});
+  const gross=Number(income.value), operating=Number(expense.value), rentCost=Number(masterRent.value);
+  res.json({income:gross,expense:operating,masterRent:rentCost,profit:gross-operating-rentCost,units:Number(units.value),occupied:Number(active.value),occupancy:Number(units.value)?Number(active.value)/Number(units.value)*100:0,arrears:Number(arrears.value),monthly,byApartment});
 }));
 
 app.get('/api/reports/monthly',asyncHandler(async(req,res)=>{
