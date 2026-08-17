@@ -63,8 +63,24 @@ function api(url,opt={}){const o={...opt,headers:{'Content-Type':'application/js
 function admin(){return state.user?.role==='admin'}
 function theme(){return localStorage.getItem('zna-theme')||'light'}
 function setTheme(t){localStorage.setItem('zna-theme',t);document.body.dataset.theme=t;render()}
-function openNav(){document.body.classList.add('nav-open');$('drawerOverlay')?.classList.add('active')}
-function closeNav(){document.body.classList.remove('nav-open');$('drawerOverlay')?.classList.remove('active')}
+async function logout(){
+  const btns=document.querySelectorAll('[onclick*="logout"]');
+  btns.forEach(b=>{b.disabled=true;b.style.pointerEvents='none';});
+  try{
+    const csrf=state?.csrf||'';
+    await fetch('/api/auth/logout',{
+      method:'POST',
+      credentials:'include',
+      headers:{'Content-Type':'application/json','X-CSRF-Token':csrf}
+    });
+  }catch(e){}
+  try{localStorage.removeItem('zna-theme');sessionStorage.clear();}catch(e){}
+  state.user=null;
+  state.csrf=null;
+  window.location.href='/';
+}
+function openNav(){document.body.classList.add('nav-open');document.querySelector('.sidebar')?.classList.add('is-open');$('drawerOverlay')?.classList.add('active');document.body.style.overflow='hidden'}
+function closeNav(){document.body.classList.remove('nav-open');document.querySelector('.sidebar')?.classList.remove('is-open');$('drawerOverlay')?.classList.remove('active');document.body.style.overflow=''}
 function toast(msg,ok=true){const x=document.createElement('div');x.style='position:fixed;right:18px;bottom:18px;z-index:200;padding:12px 15px;border-radius:11px;background:'+(ok?'#183a2f':'#4b2421')+';color:#fff;box-shadow:0 15px 40px #0004;font-size:12px;font-weight:700';x.innerHTML='<i class="fas '+(ok?'fa-circle-check':'fa-circle-exclamation')+'"></i> '+esc(msg);document.body.appendChild(x);setTimeout(()=>x.remove(),2800)}
 async function boot(){document.body.dataset.theme=theme();try{const m=await api('/api/auth/me');state.user=m.user;state.csrf=m.csrfToken;await load();render()}catch{login()}}
 async function load(){const [a,u,g,s,e,d,f,ml,pp]=await Promise.all([api('/api/apartments'),api('/api/units'),api('/api/guests'),api('/api/stays'),api('/api/expenses'),api('/api/dashboard'),api('/api/property-financials'),api('/api/apartment-leases'),api('/api/property-partners')]);Object.assign(state,{apartments:a,units:u,guests:g,stays:s,expenses:e,dashboard:d,financials:f,masterLeases:ml,partners:pp});if(admin())state.users=await api('/api/users')}
@@ -99,82 +115,33 @@ function openExpense(){modal('Tambah Pengeluaran',`<div class="form-grid"><div c
 function openUser(id){const u=id?state.users.find(x=>Number(x.id)===Number(id)):null;modal(id?'Edit akun':'Tambah akun',`<div class="form-grid"><div class="field"><label>Nama</label><input id="unm" value="${esc(u?.name||'')}"></div><div class="field"><label>Email</label><input id="uem" type="email" value="${esc(u?.email||'')}" ${id?'disabled':''}></div><div class="field"><label>Role</label><select id="uro"><option value="viewer" ${u?.role!=='admin'?'selected':''}>Viewer — read only</option><option value="admin" ${u?.role==='admin'?'selected':''}>Admin — input & edit</option></select></div><div class="field"><label>Password ${id?'(kosong = tetap)':''}</label><input id="ups" type="password" minlength="8"></div></div>`,async()=>{const b={name:$('unm').value,role:$('uro').value};if(!id){b.email=$('uem').value;b.password=$('ups').value;if(b.password.length<8)throw Error('Password minimal 8 karakter')}else if($('ups').value)b.password=$('ups').value;await api(id?`/api/users/${id}`:'/api/users',{method:id?'PUT':'POST',body:JSON.stringify(b)})})}
 boot();
 </script>
+>
+>
 
+<style>
+@media(max-width:900px){
+  .sidebar{position:fixed!important;left:0!important;top:0!important;bottom:0!important;width:min(290px,88vw)!important;height:100dvh!important;transform:translate3d(-110%,0,0)!important;transition:transform .25s cubic-bezier(.2,.8,.2,1)!important;z-index:100!important;overflow-y:auto!important}
+  body.nav-open .sidebar,.sidebar.is-open{transform:translate3d(0,0,0)!important}
+  .drawer-overlay{z-index:90!important}
+  .mobile-head{display:flex!important}
+}
+@media(min-width:901px){.mobile-head{display:none!important}}
+</style>
 <script>
 (function(){
-  const logout = async () => {
-    try {
-      await fetch('/api/auth/logout', {
-        method:'POST',
-        credentials:'include',
-        headers:{'Content-Type':'application/json'}
-      });
-    } catch(e) {}
-    try { localStorage.removeItem('zna-theme'); sessionStorage.clear(); } catch(e) {}
-    window.location.replace('/');
-  };
+  function ready(){
+    const overlay=document.getElementById('drawerOverlay');
+    document.addEventListener('keydown',e=>{if(e.key==='Escape')closeNav();});
+    overlay?.addEventListener('click',closeNav);
 
-  document.addEventListener('click', function(e){
-    const el=e.target.closest('[data-action="logout"],#logoutBtn,#logoutButton,.logout-btn');
-    if(!el) return;
-    e.preventDefault();
-    e.stopPropagation();
-    logout();
-  });
-
-  document.addEventListener('submit', function(e){
-    if(e.target.matches('#logoutForm,.logout-form')){
-      e.preventDefault();
-      logout();
-    }
-  });
-})();
-</script>
-
-<script>
-(function(){
-  const getSidebar=()=>document.querySelector('.sidebar,.app-sidebar,#sidebar');
-  let backdrop=document.querySelector('.sidebar-backdrop');
-  if(!backdrop){
-    backdrop=document.createElement('div');
-    backdrop.className='sidebar-backdrop';
-    document.body.appendChild(backdrop);
+    document.addEventListener('click',function(e){
+      const menu=e.target.closest('.mobile-head button:first-child,[onclick*="openNav"]');
+      if(menu){e.preventDefault();openNav();return;}
+      const nav=e.target.closest('.nav-btn');
+      if(nav && window.innerWidth<=900) setTimeout(closeNav,0);
+    },true);
   }
-
-  function openSidebar(){
-    const s=getSidebar(); if(!s) return;
-    s.classList.add('is-open');
-    document.body.classList.add('sidebar-open');
-    backdrop.classList.add('is-visible');
-  }
-  function closeSidebar(){
-    const s=getSidebar(); if(!s) return;
-    s.classList.remove('is-open');
-    document.body.classList.remove('sidebar-open');
-    backdrop.classList.remove('is-visible');
-  }
-
-  document.addEventListener('click', function(e){
-    const open=e.target.closest('[data-sidebar-toggle],#menuBtn,#mobileMenuBtn,.mobile-menu-btn,.hamburger');
-    if(open){ e.preventDefault(); openSidebar(); return; }
-
-    const close=e.target.closest('[data-sidebar-close],#sidebarClose,.sidebar-close');
-    if(close){ e.preventDefault(); closeSidebar(); return; }
-
-    if(e.target===backdrop){ closeSidebar(); return; }
-
-    if(e.target.closest('.sidebar a,.sidebar button.nav-item,.sidebar .nav button')){
-      if(window.matchMedia('(max-width: 900px)').matches) closeSidebar();
-    }
-  });
-
-  document.addEventListener('keydown', e=>{
-    if(e.key==='Escape') closeSidebar();
-  });
-
-  window.addEventListener('resize', ()=>{
-    if(window.innerWidth>900) closeSidebar();
-  });
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',ready); else ready();
 })();
 </script>
 </body>
