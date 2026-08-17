@@ -18,6 +18,37 @@
 @media(max-width:650px){.kpis{grid-template-columns:repeat(2,1fr);gap:9px}.kpi{padding:13px}.kpi-value{font-size:18px}.property-grid{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.field.full{grid-column:auto}.title{font-size:27px}.section{padding:13px}.btn{padding:9px 11px}.actions{width:100%}.actions .btn{flex:1;justify-content:center}.property-metrics{grid-template-columns:repeat(3,1fr)}.modal-backdrop{padding:8px}.modal{max-height:94dvh}.login-points{grid-template-columns:1fr}.mobile-head .btn{padding:8px 10px}}
 @media(max-width:430px){.kpis{grid-template-columns:1fr}.property-metrics{grid-template-columns:1fr 1fr 1fr}.subtitle{font-size:12px}}
 </style>
+
+<style>
+.sidebar-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,.48);backdrop-filter:blur(2px);z-index:90;opacity:0;transition:opacity .2s ease}
+.sidebar-backdrop.is-visible{display:block;opacity:1}
+body.sidebar-open{overflow:hidden}
+@media(max-width:900px){
+  .app{grid-template-columns:1fr!important}
+  .sidebar,.app-sidebar{
+    position:fixed!important;
+    left:0!important;top:0!important;bottom:0!important;
+    width:min(300px,86vw)!important;
+    height:100dvh!important;
+    z-index:100!important;
+    transform:translateX(-105%)!important;
+    transition:transform .22s ease,box-shadow .22s ease!important;
+    overflow-y:auto!important;
+  }
+  .sidebar.is-open,.app-sidebar.is-open{
+    transform:translateX(0)!important;
+    box-shadow:18px 0 60px rgba(0,0,0,.28)!important;
+  }
+  .main,.content,.app-main{min-width:0!important;width:100%!important}
+  .topbar{position:sticky;top:0;z-index:70}
+  .mobile-menu-btn,.hamburger,#menuBtn,#mobileMenuBtn{
+    display:inline-flex!important;align-items:center;justify-content:center;
+  }
+}
+@media(min-width:901px){
+  .mobile-menu-btn,.hamburger,#menuBtn,#mobileMenuBtn{display:none!important}
+}
+</style>
 </head>
 <body data-theme="light">
 <div id="app"></div>
@@ -67,6 +98,84 @@ function openStayPayment(id){const s=state.stays.find(x=>Number(x.id)===Number(i
 function openExpense(){modal('Tambah Pengeluaran',`<div class="form-grid"><div class="field"><label>Property</label><select id="ea">${state.apartments.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('')}</select></div><div class="field"><label>Tanggal</label><input id="ed" type="date" value="${dateNow()}"></div><div class="field"><label>Kategori</label><input id="ec" placeholder="Cleaning, listrik, maintenance"></div><div class="field"><label>Nominal</label><input id="em" type="number" min="0"></div><div class="field"><label>Vendor</label><input id="ev"></div><div class="field full"><label>Deskripsi</label><textarea id="ex"></textarea></div></div>`,async()=>{await api('/api/expenses',{method:'POST',body:JSON.stringify({apartment_id:$('ea').value,expense_date:$('ed').value,category:$('ec').value,amount:$('em').value,vendor:$('ev').value,description:$('ex').value})})})}
 function openUser(id){const u=id?state.users.find(x=>Number(x.id)===Number(id)):null;modal(id?'Edit akun':'Tambah akun',`<div class="form-grid"><div class="field"><label>Nama</label><input id="unm" value="${esc(u?.name||'')}"></div><div class="field"><label>Email</label><input id="uem" type="email" value="${esc(u?.email||'')}" ${id?'disabled':''}></div><div class="field"><label>Role</label><select id="uro"><option value="viewer" ${u?.role!=='admin'?'selected':''}>Viewer — read only</option><option value="admin" ${u?.role==='admin'?'selected':''}>Admin — input & edit</option></select></div><div class="field"><label>Password ${id?'(kosong = tetap)':''}</label><input id="ups" type="password" minlength="8"></div></div>`,async()=>{const b={name:$('unm').value,role:$('uro').value};if(!id){b.email=$('uem').value;b.password=$('ups').value;if(b.password.length<8)throw Error('Password minimal 8 karakter')}else if($('ups').value)b.password=$('ups').value;await api(id?`/api/users/${id}`:'/api/users',{method:id?'PUT':'POST',body:JSON.stringify(b)})})}
 boot();
+</script>
+
+<script>
+(function(){
+  const logout = async () => {
+    try {
+      await fetch('/api/auth/logout', {
+        method:'POST',
+        credentials:'include',
+        headers:{'Content-Type':'application/json'}
+      });
+    } catch(e) {}
+    try { localStorage.removeItem('zna-theme'); sessionStorage.clear(); } catch(e) {}
+    window.location.replace('/');
+  };
+
+  document.addEventListener('click', function(e){
+    const el=e.target.closest('[data-action="logout"],#logoutBtn,#logoutButton,.logout-btn');
+    if(!el) return;
+    e.preventDefault();
+    e.stopPropagation();
+    logout();
+  });
+
+  document.addEventListener('submit', function(e){
+    if(e.target.matches('#logoutForm,.logout-form')){
+      e.preventDefault();
+      logout();
+    }
+  });
+})();
+</script>
+
+<script>
+(function(){
+  const getSidebar=()=>document.querySelector('.sidebar,.app-sidebar,#sidebar');
+  let backdrop=document.querySelector('.sidebar-backdrop');
+  if(!backdrop){
+    backdrop=document.createElement('div');
+    backdrop.className='sidebar-backdrop';
+    document.body.appendChild(backdrop);
+  }
+
+  function openSidebar(){
+    const s=getSidebar(); if(!s) return;
+    s.classList.add('is-open');
+    document.body.classList.add('sidebar-open');
+    backdrop.classList.add('is-visible');
+  }
+  function closeSidebar(){
+    const s=getSidebar(); if(!s) return;
+    s.classList.remove('is-open');
+    document.body.classList.remove('sidebar-open');
+    backdrop.classList.remove('is-visible');
+  }
+
+  document.addEventListener('click', function(e){
+    const open=e.target.closest('[data-sidebar-toggle],#menuBtn,#mobileMenuBtn,.mobile-menu-btn,.hamburger');
+    if(open){ e.preventDefault(); openSidebar(); return; }
+
+    const close=e.target.closest('[data-sidebar-close],#sidebarClose,.sidebar-close');
+    if(close){ e.preventDefault(); closeSidebar(); return; }
+
+    if(e.target===backdrop){ closeSidebar(); return; }
+
+    if(e.target.closest('.sidebar a,.sidebar button.nav-item,.sidebar .nav button')){
+      if(window.matchMedia('(max-width: 900px)').matches) closeSidebar();
+    }
+  });
+
+  document.addEventListener('keydown', e=>{
+    if(e.key==='Escape') closeSidebar();
+  });
+
+  window.addEventListener('resize', ()=>{
+    if(window.innerWidth>900) closeSidebar();
+  });
+})();
 </script>
 </body>
 </html>
